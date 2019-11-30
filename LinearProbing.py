@@ -18,8 +18,9 @@ from dataset import RGB2Lab, RGB2YCbCr
 from util import adjust_learning_rate, AverageMeter, accuracy
 
 from models.alexnet import MyAlexNetCMC
+from models.alexnet_small import MyAlexNetSmallCMC
 from models.resnet import MyResNetsCMC
-from models.LinearModel import LinearClassifierAlexNet, LinearClassifierResNet
+from models.LinearModel import LinearClassifierAlexNet, LinearClassifierResNet, LinearClassifierAlexNetSmall
 
 from spawn import spawn
 
@@ -33,12 +34,13 @@ def parse_option():
     parser.add_argument('--save_freq', type=int, default=5, help='save frequency')
     parser.add_argument('--batch_size', type=int, default=256, help='batch_size')
     parser.add_argument('--num_workers', type=int, default=32, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=60, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=100, help='number of training epochs')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.1, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='30,40,50', help='where to decay lr, can be a list')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='learning rate')
+    parser.add_argument('--lr_decay_epochs', type=str, default='60,80', help='where to decay lr, can be a list')
     parser.add_argument('--lr_decay_rate', type=float, default=0.2, help='decay rate for learning rate')
+    parser.add_argument('--optim', type=str, default='adam', choices=['sgd', 'adam'])
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam')
@@ -48,23 +50,23 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
 
     # model definition
-    parser.add_argument('--model', type=str, default='alexnet', choices=['alexnet',
+    parser.add_argument('--model', type=str, default='alexnet_small', choices=['alexnet_small', 'alexnet',
                                                                          'resnet50v1', 'resnet101v1', 'resnet18v1',
                                                                          'resnet50v2', 'resnet101v2', 'resnet18v2',
                                                                          'resnet50v3', 'resnet101v3', 'resnet18v3'])
     parser.add_argument('--model_path', type=str, default=None, help='the model to test')
-    parser.add_argument('--layer', type=int, default=6, help='which layer to evaluate')
+    parser.add_argument('--layer', type=int, default=7, help='which layer to evaluate')
 
     # dataset
-    parser.add_argument('--dataset', type=str, default='imagenet', choices=['imagenet100', 'imagenet'])
+    parser.add_argument('--dataset', type=str, default='stl10', choices=['imagenet100', 'imagenet', 'stl10'])
 
     # add new views
     parser.add_argument('--view', type=str, default='Lab', choices=['Lab', 'YCbCr'])
 
     # path definition
-    parser.add_argument('--data_folder', type=str, default=None, help='path to data')
+    parser.add_argument('--data_folder', type=str, default='./data', help='path to data')
+    parser.add_argument('--tb_path', type=str, default='./tb', help='path to tensorboard')
     parser.add_argument('--save_path', type=str, default=None, help='path to save linear classifier')
-    parser.add_argument('--tb_path', type=str, default=None, help='path to tensorboard')
 
     # data crop threshold
     parser.add_argument('--crop_low', type=float, default=0.2, help='low area in crop')
@@ -99,54 +101,91 @@ def parse_option():
     if not os.path.isdir(opt.tb_folder):
         os.makedirs(opt.tb_folder)
 
-    opt.save_folder = os.path.join(opt.save_path, opt.model_name)
+    opt.save_folder = os.path.join(opt.save_path, 'linear_probe', opt.model_name)
     if not os.path.isdir(opt.save_folder):
         os.makedirs(opt.save_folder)
 
     if opt.dataset == 'imagenet100':
         opt.n_label = 100
-    if opt.dataset == 'imagenet':
+    elif opt.dataset == 'imagenet':
         opt.n_label = 1000
+    elif opt.dataset == 'stl10':
+        opt.n_label = 10
 
     return opt
 
 
 def get_train_val_loader(args):
-    train_folder = os.path.join(args.data_folder, 'train')
-    val_folder = os.path.join(args.data_folder, 'val')
+    if 'imagenet' in args.dataset:
+        train_folder = os.path.join(args.data_folder, 'train')
+        val_folder = os.path.join(args.data_folder, 'val')
 
-    if args.view == 'Lab':
-        mean = [(0 + 100) / 2, (-86.183 + 98.233) / 2, (-107.857 + 94.478) / 2]
-        std = [(100 - 0) / 2, (86.183 + 98.233) / 2, (107.857 + 94.478) / 2]
-        color_transfer = RGB2Lab()
-    elif args.view == 'YCbCr':
-        mean = [116.151, 121.080, 132.342]
-        std = [109.500, 111.855, 111.964]
-        color_transfer = RGB2YCbCr()
+        if args.view == 'Lab':
+            mean = [(0 + 100) / 2, (-86.183 + 98.233) / 2, (-107.857 + 94.478) / 2]
+            std = [(100 - 0) / 2, (86.183 + 98.233) / 2, (107.857 + 94.478) / 2]
+            color_transfer = RGB2Lab()
+        elif args.view == 'YCbCr':
+            mean = [116.151, 121.080, 132.342]
+            std = [109.500, 111.855, 111.964]
+            color_transfer = RGB2YCbCr()
+        else:
+            raise NotImplemented('view not implemented {}'.format(args.view))
+
+        normalize = transforms.Normalize(mean=mean, std=std)
+        train_dataset = datasets.ImageFolder(
+            train_folder,
+            transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                color_transfer,
+                transforms.ToTensor(),
+                normalize,
+            ])
+        )
+        val_dataset = datasets.ImageFolder(
+            val_folder,
+            transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                color_transfer,
+                transforms.ToTensor(),
+                normalize,
+            ])
+        )
     else:
-        raise NotImplemented('view not implemented {}'.format(args.view))
+        assert args.dataset == 'stl10'
+        assert args.view == 'Lab'
 
-    normalize = transforms.Normalize(mean=mean, std=std)
-    train_dataset = datasets.ImageFolder(
-        train_folder,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.0)),
+        mean = [(0 + 100) / 2,
+                (-86.183 + 98.233) / 2,
+                (-107.857 + 94.478) / 2]
+        std = [(100 - 0) / 2,
+               (86.183 + 98.233) / 2,
+               (107.857 + 94.478) / 2]
+        train_transform = transforms.Compose([
+            # transforms.RandomCrop(64),
+            # transforms.RandomResizedCrop(64, scale=(args.crop_low, 1)),
+            transforms.RandomResizedCrop(64, scale=(0.3, 1.0), ratio=(0.7, 1.4)),
             transforms.RandomHorizontalFlip(),
-            color_transfer,
+            RGB2Lab(),
             transforms.ToTensor(),
-            normalize,
+            transforms.Normalize(mean=mean, std=std)
         ])
-    )
-    val_dataset = datasets.ImageFolder(
-        val_folder,
-        transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            color_transfer,
+        test_transform = transforms.Compose([
+            transforms.Resize(70),
+            transforms.CenterCrop(64),
+            RGB2Lab(),
             transforms.ToTensor(),
-            normalize,
+            transforms.Normalize(mean=mean, std=std)
         ])
-    )
+
+        train_dataset = datasets.STL10(
+            args.data_folder, 'train',
+            transform=train_transform, download=True)
+        val_dataset = datasets.STL10(
+            args.data_folder, 'test',
+            transform=test_transform, download=True)
+
     print('number of train: {}'.format(len(train_dataset)))
     print('number of val: {}'.format(len(val_dataset)))
 
@@ -164,7 +203,10 @@ def get_train_val_loader(args):
 
 
 def set_model(args):
-    if args.model.startswith('alexnet'):
+    if args.model == 'alexnet_small':
+        model = MyAlexNetSmallCMC()
+        classifier = LinearClassifierAlexNetSmall(layer=args.layer, n_label=args.n_label, pool_type='max')
+    elif args.model.startswith('alexnet'):
         model = MyAlexNetCMC()
         classifier = LinearClassifierAlexNet(layer=args.layer, n_label=args.n_label, pool_type='max')
     elif args.model.startswith('resnet'):
@@ -198,10 +240,16 @@ def set_model(args):
 
 
 def set_optimizer(args, classifier):
-    optimizer = optim.SGD(classifier.parameters(),
-                          lr=args.learning_rate,
-                          momentum=args.momentum,
-                          weight_decay=args.weight_decay)
+    if args.optim == 'sgd':
+        optimizer = optim.SGD(classifier.parameters(),
+                              lr=args.learning_rate,
+                              momentum=args.momentum,
+                              weight_decay=args.weight_decay)
+    else:
+        optimizer = optim.Adam(classifier.parameters(),
+                               lr=args.learning_rate,
+                               betas=(args.beta1, args.beta2),
+                               weight_decay=args.weight_decay)
     return optimizer
 
 

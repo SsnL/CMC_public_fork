@@ -17,13 +17,14 @@ from torchvision import transforms, datasets
 from dataset import RGB2Lab, RGB2YCbCr
 from util import adjust_learning_rate, AverageMeter
 
+from models.alexnet_small import MyAlexNetSmallCMC
 from models.alexnet import MyAlexNetCMC
 from models.resnet import MyResNetsCMC
 from NCE.NCEAverage import NCEAverage
 from NCE.NCECriterion import NCECriterion
 from NCE.NCECriterion import NCESoftmaxLoss
 
-from dataset import ImageFolderInstance
+from dataset import ImageFolderInstance, DatasetInstance
 
 try:
     from apex import amp, optimizers
@@ -43,11 +44,11 @@ def parse_option():
     parser.add_argument('--save_freq', type=int, default=10, help='save frequency')
     parser.add_argument('--batch_size', type=int, default=128, help='batch_size')
     parser.add_argument('--num_workers', type=int, default=18, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=240, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=300, help='number of training epochs')
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.03, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='250,300,350', help='where to decay lr, can be a list')
+    parser.add_argument('--lr_decay_epochs', type=str, default='200,240,280', help='where to decay lr, can be a list')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam')
@@ -59,23 +60,23 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
 
     # model definition
-    parser.add_argument('--model', type=str, default='alexnet', choices=['alexnet',
+    parser.add_argument('--model', type=str, default='alexnet_small', choices=['alexnet', 'alexnet_small',
                                                                          'resnet50v1', 'resnet101v1', 'resnet18v1',
                                                                          'resnet50v2', 'resnet101v2', 'resnet18v2',
                                                                          'resnet50v3', 'resnet101v3', 'resnet18v3'])
     parser.add_argument('--softmax', action='store_true', help='using softmax contrastive loss rather than NCE')
-    parser.add_argument('--nce_k', type=int, default=16384)
-    parser.add_argument('--nce_t', type=float, default=0.07)
+    parser.add_argument('--nce_k', type=int, default=4096, help='16384 for imagenet')
+    parser.add_argument('--nce_t', type=float, default=0.1, help='0.07 for imagenet')
     parser.add_argument('--nce_m', type=float, default=0.5)
-    parser.add_argument('--feat_dim', type=int, default=128, help='dim of feat for inner product')
+    parser.add_argument('--feat_dim', type=int, default=128, help='dim of feat for inner product; 128 for imagenet')
 
     # dataset
-    parser.add_argument('--dataset', type=str, default='imagenet', choices=['imagenet100', 'imagenet'])
+    parser.add_argument('--dataset', type=str, default='stl10', choices=['imagenet100', 'imagenet', 'stl10'])
 
     # specify folder
-    parser.add_argument('--data_folder', type=str, default=None, help='path to data')
-    parser.add_argument('--model_path', type=str, default=None, help='path to save model')
-    parser.add_argument('--tb_path', type=str, default=None, help='path to tensorboard')
+    parser.add_argument('--data_folder', type=str, default='./data', help='path to data')
+    parser.add_argument('--model_path', type=str, default='./results', help='path to save model')
+    parser.add_argument('--tb_path', type=str, default='./tb', help='path to tensorboard')
 
     # add new views
     parser.add_argument('--view', type=str, default='Lab', choices=['Lab', 'YCbCr'])
@@ -126,30 +127,53 @@ def parse_option():
 
 def get_train_loader(args):
     """get the train loader"""
-    data_folder = os.path.join(args.data_folder, 'train')
+    if 'imagenet' in args.dataset:
+        data_folder = os.path.join(args.data_folder, 'train')
 
-    if args.view == 'Lab':
-        mean = [(0 + 100) / 2, (-86.183 + 98.233) / 2, (-107.857 + 94.478) / 2]
-        std = [(100 - 0) / 2, (86.183 + 98.233) / 2, (107.857 + 94.478) / 2]
-        color_transfer = RGB2Lab()
-    elif args.view == 'YCbCr':
-        mean = [116.151, 121.080, 132.342]
-        std = [109.500, 111.855, 111.964]
-        color_transfer = RGB2YCbCr()
+        if args.view == 'Lab':
+            mean = [(0 + 100) / 2, (-86.183 + 98.233) / 2, (-107.857 + 94.478) / 2]
+            std = [(100 - 0) / 2, (86.183 + 98.233) / 2, (107.857 + 94.478) / 2]
+            color_transfer = RGB2Lab()
+        elif args.view == 'YCbCr':
+            mean = [116.151, 121.080, 132.342]
+            std = [109.500, 111.855, 111.964]
+            color_transfer = RGB2YCbCr()
+        else:
+            raise NotImplemented('view not implemented {}'.format(args.view))
+        normalize = transforms.Normalize(mean=mean, std=std)
+
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.)),
+            transforms.RandomHorizontalFlip(),
+            color_transfer,
+            transforms.ToTensor(),
+            normalize,
+        ])
+        train_dataset = ImageFolderInstance(data_folder, transform=train_transform)
     else:
-        raise NotImplemented('view not implemented {}'.format(args.view))
-    normalize = transforms.Normalize(mean=mean, std=std)
+        assert args.dataset == 'stl10'
+        assert args.view == 'Lab'
 
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(args.crop_low, 1.)),
-        transforms.RandomHorizontalFlip(),
-        color_transfer,
-        transforms.ToTensor(),
-        normalize,
-    ])
-    train_dataset = ImageFolderInstance(data_folder, transform=train_transform)
+        mean = [(0 + 100) / 2,
+                (-86.183 + 98.233) / 2,
+                (-107.857 + 94.478) / 2]
+        std = [(100 - 0) / 2,
+               (86.183 + 98.233) / 2,
+               (107.857 + 94.478) / 2]
+        train_transform = transforms.Compose([
+            # transforms.RandomCrop(64),
+            transforms.RandomResizedCrop(64, scale=(args.crop_low, 1)),
+            transforms.RandomHorizontalFlip(),
+            RGB2Lab(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+        train_dataset = datasets.STL10(
+            args.data_folder, 'train+unlabeled',
+            transform=train_transform, download=True)
+        train_dataset = DatasetInstance(train_dataset)
+
     train_sampler = None
-
     # train loader
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
@@ -164,7 +188,9 @@ def get_train_loader(args):
 
 def set_model(args, n_data):
     # set the model
-    if args.model == 'alexnet':
+    if args.model == 'alexnet_small':
+        model = MyAlexNetSmallCMC(args.feat_dim)
+    elif args.model == 'alexnet':
         model = MyAlexNetCMC(args.feat_dim)
     elif args.model.startswith('resnet'):
         model = MyResNetsCMC(args.model)
@@ -216,7 +242,7 @@ def train(epoch, train_loader, model, contrast, criterion_l, criterion_ab, optim
         bsz = inputs.size(0)
         inputs = inputs.float()
         if torch.cuda.is_available():
-            index = index.cuda(async=True)
+            index = index.cuda(non_blocking=True)
             inputs = inputs.cuda()
 
         # ===================forward=====================
@@ -261,7 +287,7 @@ def train(epoch, train_loader, model, contrast, criterion_l, criterion_ab, optim
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, lprobs=l_prob_meter,
                    abprobs=ab_prob_meter))
-            print(out_l.shape)
+            # print(out_l.shape)
             sys.stdout.flush()
 
     return l_loss_meter.avg, l_prob_meter.avg, ab_loss_meter.avg, ab_prob_meter.avg

@@ -36,6 +36,34 @@ class ImageFolderInstance(datasets.ImageFolder):
         return img, target, index
 
 
+class DatasetInstance(torch.utils.data.Dataset):
+    """Folder datasets which returns the index of the image as well
+    """
+
+    def __init__(self, dataset, two_crop=False):
+        super(DatasetInstance, self).__init__()
+        self.two_crop = two_crop
+        self.dataset = dataset
+
+    def __getitem__(self, index):
+        """
+        Args:
+            index (int): Index
+        Returns:
+            tuple: (image, target, index) where target is class_index of the target class.
+        """
+        img, target = self.dataset[index]
+
+        if self.two_crop:
+            img2, _ = self.dataset[index]
+            img = torch.cat([img, img2], dim=0)
+
+        return img, target, index
+
+    def __len__(self):
+        return len(self.dataset)
+
+
 class RGB2Lab(object):
     """Convert RGB PIL image to ndarray Lab."""
     def __call__(self, img):

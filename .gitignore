@@ -1,5 +1,5 @@
 .idea/
-data/
+# data/
 output*/
 ckpts/
 *.pth
@@ -115,3 +115,6 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# sftp-config
+sftp-config.json
